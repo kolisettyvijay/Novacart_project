@@ -1,0 +1,152 @@
+##Step 1- Imports and Setup
+from pyspark.sql import functions as F
+from delta.tables import DeltaTable
+from datetime import datetime
+import uuid
+
+Step 2 - Bronze Control Table
+This table stores the watermark for each source table
+The latest timestamp already processed
+The latest primary key processed at that timestamp
+how many rows were written in the latest run
+spark.sql(""" create table if not exists ap.bronze.ingestion_control(
+    layer string,
+    table_name string,
+    last_ingested timestamp,
+    ts_col string,
+    pk_col string,
+    last_successful_ts timestamp,
+    last_successful_pk bigint,
+    last_run_id string,
+    rows_written bigint,
+    run_status string,
+    updated_at timestamp
+)
+using delta
+          """)
+Step 3 - Source Table Configuration
+This cell defines which source tables will be loaded into bronze and which columns should be used as
+Primary Key
+timestamp/watermark column
+
+tables_config = {
+    'orders':{"pk:col":"order_id","ts_col":"updated_at"},
+    'products':{"pk:col":"product_id","ts_col":"updated_at"},
+    'payments':{"pk:col":"payment_id","ts_col":"processed_at"}
+}
+bronze_run_id = str(uuid.uuid4())
+print("current Bronze Run_id:",bronze_run_id)
+
+Helper Functions-----4
+get_last_successful_watermark() reads the last processed watermark from the contrlol table
+upsert_bronze_control() updates the control table after a successful bronze load
+
+def get_last_successful_watermark(table_name:str):
+    ctrl = (
+        spark.table("ap.bronze.ingestion_control")
+        .filter((F.col("layer")== 'bronze') & (F.col("table_name")== table_name) & (F.col("run_status") == 'success'))
+        .orderBy(F.col("updated_at").desc())
+        .limit(1)
+        .collect()
+    )
+    rows = ctrl
+    if len(rows)==0:
+        return None,None
+    return rows[0]['last_successful_ts'],rows[0]['last_successful_pk']
+
+from datetime import datetime, UTC
+
+def upsert_bronze_control(table_name,ts_col,pk_col,last_pk,rows_written,run_id):
+    control_df = spark.createDataFrame([
+        ('bronze',table_name,datetime.now(UTC),ts_col,pk_col,None,int(last_pk) if last_pk is not None else None,run_id,int(rows_written),'success',datetime.now(UTC))
+    ],schema="layer string,table_name string,last_ingested timestamp,ts_col string,pk_col string,last_successful_ts timestamp,last_successful_pk bigint,last_run_id string,rows_written bigint,run_status string,updated_at timestamp")
+    dt = DeltaTable.forName(spark,"ap.bronze.ingestion_control")
+    (dt.alias("t")
+     .merge(control_df.alias("s"),"t.table_name==s.table_name and t.layer==s.layer")
+     .whenMatchedUpdate(set={
+         "last_ingested": "s.last_ingested",
+         "ts_col": "s.ts_col",
+         "pk_col": "s.pk_col",
+         "last_successful_ts": "s.last_successful_ts",
+         "last_successful_pk": "s.last_successful_pk",
+         "last_run_id": "s.last_run_id",
+         "rows_written": "s.rows_written",
+         "run_status": "s.run_status",
+         "updated_at": "s.updated_at"
+     })
+     .whenNotMatchedInsertAll()
+    .execute())
+
+Step 5
+Bronze incremental load loop
+this is the main bronze logic
+for each table the notebook is,
+# reads the last watermark
+# reads the source sql table
+# filters only new / changed rows
+# adds Bronze audit columns
+# appends the rows into bronze delta table
+# updates the control table
+
+
+for table_name,cfg in tables_config.items():
+    
+    pk_col = cfg["pk:col"]
+    ts_col = cfg["ts_col"]
+    source_table = f"novacart.ns.{table_name}"
+    target_table = f"ap.bronze.{table_name}_raw"
+    last_successful_ts,last_successful_pk = get_last_successful_watermark(table_name)
+    print(f"\n=== Processing {table_name} ===")
+    print(f"Last successful ts : {last_successful_ts}")
+    print(f"Last successful pk : {last_successful_pk}")
+
+    source_df = spark.read.table(source_table).withColumn(ts_col,F.col(ts_col).cast("timestamp"))
+    if last_successful_ts is None:
+        rows_to_load = source_df 
+    else:
+        rows_to_load = source_df.filter(
+            (F.col(ts_col) > F.lit(last_successful_ts)) | 
+            (
+                (F.col(ts_col) == F.lit(last_successful_ts)) & 
+                (F.col(pk_col).cast("long") > F.lit(last_successful_pk))
+            )
+        )
+    
+    rows_to_load = (
+        rows_to_load.withColumn("bronze_ingested_at",F.current_timestamp())
+        .withColumn("bronze_run_id",F.lit(bronze_run_id))
+        .withColumn("bronze_source_table",F.lit(source_table))
+    )
+    rows_count = rows_to_load.count()
+    print(f"{table_name} rows_to_load = {rows_count}")
+
+    if rows_count == 0:
+        print(f"No new rows for {table_name}.")
+        upsert_bronze_control(
+            table_name,
+            ts_col,
+            pk_col,
+            last_successful_pk,
+            rows_count,
+            bronze_run_id
+        )
+        continue
+    
+    rows_to_load.write.format("delta").mode("append").saveAsTable(target_table)
+    max_ts = rows_to_load.agg(F.max(ts_col).alias("max_ts")).collect()[0]["max_ts"]
+    max_pk = rows_to_load.filter(F.col(ts_col)==F.lit(max_ts)).agg(F.max(pk_col).cast("long").alias("max_pk")).collect()[0]["max_pk"]
+
+    upsert_bronze_control(
+        table_name,
+        ts_col,
+        pk_col,
+        max_pk,
+        rows_count,
+        bronze_run_id
+    )
+    print(f"Wrote {rows_count} rows to {target_table}")
+
+Quick Validation
+print("orders bronze count:",spark.sql("select count(*) from ap.bronze.orders_raw").collect()[0][0])
+print("products bronze count:",spark.sql(""" select count(*) from ap.bronze.products_raw""").collect()[0][0])
+print("payments bronze count:",spark.sql(""" select count(*) from ap.bronze.payments_raw""").collect()[0][0])
